@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# zcode-remote — mở dialog Mobile remote control và in link/QR của ZCode desktop.
+#
+# Dùng:
+#   zcode-remote                # in link remote (tự mở dialog, tự decode QR)
+#   zcode-remote --link         # chỉ in link (như trên)
+#   zcode-remote --qr           # chỉ lưu ảnh QR ra /tmp/zcode-qr.png
+#   zcode-remote --open         # in link rồi mở bằng trình duyệt mặc định
+#   zcode-remote --stop         # tắt chia sẻ (bấm Stop)
+#   zcode-remote --restart      # khởi động lại ZCode kèm remote debugging
+#
+# Env tuỳ chọn: ZCODE_CDP_PORT, ZCODE_QR_FILE, ZCODE_BIN, ZCODE_LOG,
+#               ZCODE_REMOTE_NO_AUTOSTART=1 (không tự restart app).
+#
+# Yêu cầu: ZCode desktop đang chạy với --remote-debugging-port=9222
+# (script tự restart nếu thiếu, trừ khi đặt ZCODE_REMOTE_NO_AUTOSTART=1).
+set -euo pipefail
+
+CDP_PORT="${ZCODE_CDP_PORT:-9222}"
+CDP="http://127.0.0.1:${CDP_PORT}"
+QR_FILE="${ZCODE_QR_FILE:-/tmp/zcode-qr.png}"
+ZCODE_BIN="${ZCODE_BIN:-$HOME/.local/bin/zcode}"
+APP_DIR="${ZCODE_APP_DIR:-$HOME/Applications/ZCode-3.16.3}"
+LOG="${ZCODE_LOG:-/tmp/zcode-desktop.log}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+WAYLAND="${WAYLAND_DISPLAY:-wayland-1}"
+
+cdp_ok() { curl -sf --max-time 2 "${CDP}/json/version" >/dev/null 2>&1; }
+
+zcode_running() { pgrep -f 'ZCode-[0-9.]*/zcode' >/dev/null 2>&1; }
+
+start_zcode() {
+  echo "→ khởi động lại ZCode kèm remote debugging (port ${CDP_PORT})..." >&2
+  pgrep -f 'ZCode-[0-9.]*/zcode' | xargs -r kill 2>/dev/null || true
+  sleep 3
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND" \
+    setsid "$ZCODE_BIN" --ozone-platform=wayland \
+    --remote-debugging-port="$CDP_PORT" --remote-allow-origins='*' \
+    >"$LOG" 2>&1 </dev/null &
+  for _ in $(seq 1 40); do
+    sleep 1
+    cdp_ok && return 0
+  done
+  echo "Lỗi: CDP không lên sau 40s. Xem $LOG" >&2
+  exit 1
+}
+
+force_restart=0
+for a in "$@"; do [ "$a" = "--restart" ] && force_restart=1; done
+
+if [ "$force_restart" = "1" ]; then
+  start_zcode
+elif ! cdp_ok; then
+  if [ "${ZCODE_REMOTE_NO_AUTOSTART:-0}" = "1" ]; then
+    echo "Lỗi: ZCode không chạy với --remote-debugging-port=${CDP_PORT}" >&2
+    echo "Chạy: zcode-remote --restart" >&2
+    exit 1
+  fi
+  zcode_running && echo "→ ZCode đang chạy nhưng thiếu CDP, restart..." >&2
+  start_zcode
+fi
+
+exec node --input-type=module - "$@" <<'NODE'
+const args = process.argv.slice(2);
+const port = process.env.ZCODE_CDP_PORT || "9222";
+const qrFile = process.env.ZCODE_QR_FILE || "/tmp/zcode-qr.png";
+const wantOpen = args.includes("--open");
+const wantStop = args.includes("--stop");
+const linkOnly = args.includes("--link");
+const qrOnly = args.includes("--qr");
+const BASE = `http://127.0.0.1:${port}`;
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function page() {
+  // Sau --restart, CDP mở trước khi renderer tạo page: chờ tối đa 40s.
+  for (let i = 0; i < 40; i++) {
+    try {
+      const list = await (await fetch(`${BASE}/json/list`)).json();
+      const p = list.find((t) => t.type === "page");
+      if (p) return p;
+    } catch {}
+    await sleepMs(1000);
+  }
+  throw new Error("không tìm thấy page ZCode sau 40s");
+}
+
+function connect(wsUrl) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(wsUrl);
+    let id = 0;
+    const pending = new Map();
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
+    };
+    ws.onopen = () => resolve({
+      send: (method, params = {}) => new Promise((res) => {
+        const mid = ++id; pending.set(mid, res);
+        ws.send(JSON.stringify({ id: mid, method, params }));
+      }),
+      close: () => ws.close(),
+    });
+  });
+}
+
+const evaluate = (cdp, expression) =>
+  cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true })
+    .then((r) => r.result?.result?.value);
+
+const cdp = await connect((await page()).webSocketDebuggerUrl);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const clickByText = (text) => evaluate(cdp, `(() => {
+  const t = ${JSON.stringify(text)};
+  const els = [...document.querySelectorAll('button,[role="button"],a,[role="menuitem"]')];
+  const el = els.find(e => ((e.innerText || e.getAttribute('aria-label') || '').trim()).includes(t));
+  if (!el) return false;
+  el.scrollIntoView({block:'center'}); el.click(); return true;
+})()`);
+
+const dialogOpen = () => evaluate(cdp, `!!document.querySelector('[role="dialog"]')`);
+
+if (wantStop) {
+  const ok = await clickByText("Stop");
+  console.log(ok ? "Đã bấm Stop — remote đã tắt." : "Không tìm thấy nút Stop (dialog chưa mở?)");
+  cdp.close(); process.exit(0);
+}
+
+if (!(await dialogOpen())) {
+  // UI cần thời gian render sau khi page mới xuất hiện (nhất là sau --restart).
+  let opened = false;
+  for (let i = 0; i < 60; i++) {
+    opened = await clickByText("Mobile remote control");
+    if (opened) break;
+    await sleep(1000);
+  }
+  if (!opened) {
+    console.error("Lỗi: không tìm thấy nút 'Mobile remote control' sau 60s.");
+    cdp.close();
+    process.exit(1);
+  }
+  await sleep(1500);
+}
+
+if (qrOnly) {
+  const src = await evaluate(cdp, `(() => {
+    const d = document.querySelector('[role="dialog"]');
+    const img = d && ([...d.querySelectorAll('img')].find(i => i.getBoundingClientRect().width > 200));
+    return img ? img.src : null;
+  })()`);
+  if (!src || !src.startsWith("data:image")) { console.error("Lỗi: chưa có QR (có thể remote đã paired)."); process.exit(1); }
+  const fs = await import("node:fs/promises");
+  await fs.writeFile(qrFile, Buffer.from(src.split(",")[1], "base64"));
+  console.log(qrFile);
+  cdp.close(); process.exit(0);
+}
+
+// Copy link rồi đọc lại qua chính app: dialog có nút Copy link.
+const copied = await clickByText("Copy link");
+if (!copied) {
+  console.error("Lỗi: không tìm thấy nút 'Copy link'.");
+  cdp.close(); process.exit(1);
+}
+await sleep(500);
+
+// Link nằm trong clipboard; không giả định có xclip/wl-paste, đọc từ state của app.
+const uiLink = await evaluate(cdp, `(() => {
+  const d = document.querySelector('[role="dialog"]');
+  const html = d ? d.innerHTML : '';
+  const m = html.match(/https:\\/\\/zcode\\.z\\.ai\\/remote\\/v4[^"'<>\\\\ ]+/);
+  if (m) return m[0];
+  const txt = d ? d.innerText : '';
+  const t = txt.match(/https?:\\/\\/\\S+/);
+  return t ? t[0] : null;
+})()`);
+
+let resolved = uiLink;
+if (!resolved) {
+  // Link không nằm trong DOM: lấy QR rồi decode bằng zbarimg.
+  const src = await evaluate(cdp, `(() => {
+    const d = document.querySelector('[role="dialog"]');
+    const img = d && ([...d.querySelectorAll('img')].find(i => i.getBoundingClientRect().width > 200));
+    return img ? img.src : null;
+  })()`);
+  if (src?.startsWith("data:image")) {
+    const fs = await import("node:fs/promises");
+    await fs.writeFile(qrFile, Buffer.from(src.split(",")[1], "base64"));
+    const { execFileSync } = await import("node:child_process");
+    try {
+      resolved = execFileSync("zbarimg", ["--quiet", "--raw", qrFile], { encoding: "utf8" }).trim();
+    } catch {
+      resolved = null;
+    }
+    if (!resolved) {
+      console.log(`QR: ${qrFile}`);
+      console.error("Không decode được QR. Mở ảnh trên rồi quét bằng điện thoại.");
+      cdp.close(); process.exit(2);
+    }
+  } else {
+    console.error("Không tìm thấy QR trong dialog (remote có thể đã paired hoặc đang lỗi).");
+    cdp.close(); process.exit(2);
+  }
+}
+const link = resolved;
+if (!link) {
+  console.error("Không lấy được link remote.");
+  cdp.close();
+  process.exit(2);
+}
+
+console.log(link);
+if (wantOpen) {
+  const { execFile } = await import("node:child_process");
+  execFile("xdg-open", [link], () => {});
+}
+cdp.close();
+NODE

@@ -1,0 +1,5 @@
+*.AppImage
+*.deb
+*.rpm
+*.tar.gz
+.DS_Store

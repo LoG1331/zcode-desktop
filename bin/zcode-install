@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# zcode-install — tải ZCode desktop bản chính thức từ CDN và cài vào ~/Applications.
+#
+# Không cần sudo, không cần FUSE: AppImage được extract ra thư mục thường
+# (máy thiếu libfuse2 vẫn chạy được), sau đó tạo wrapper + desktop entry.
+#
+# Dùng:
+#   zcode-install                 # tải bản mới nhất, cài (hoặc cập nhật)
+#   zcode-install --version 3.16.3  # ghim version cụ thể
+#   zcode-install --deb           # thay vì AppImage, tải .deb (cần sudo để cài)
+#   zcode-install --rpm           # thay vì AppImage, tải .rpm (cần sudo để cài)
+#   zcode-install --check         # chỉ in version mới nhất, không tải
+#   zcode-install --force         # cài lại dù version đã có
+#
+# Env: ZCODE_CDN (mặc định CDN chính thức), ZCODE_INSTALL_DIR, ZCODE_BIN_DIR.
+set -euo pipefail
+
+CDN="${ZCODE_CDN:-https://cdn-zcode.z.ai/zcode/electron/releases}"
+INSTALL_DIR="${ZCODE_INSTALL_DIR:-$HOME/Applications}"
+BIN_DIR="${ZCODE_BIN_DIR:-$HOME/.local/bin}"
+PLATFORM="${ZCODE_PLATFORM:-linux-$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')}"
+MODE="appimage"
+PIN_VERSION=""
+FORCE=0
+CHECK_ONLY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) PIN_VERSION="${2:?--version cần giá trị}"; shift 2 ;;
+    --deb) MODE="deb"; shift ;;
+    --rpm) MODE="rpm"; shift ;;
+    --force) FORCE=1; shift ;;
+    --check) CHECK_ONLY=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "Tham số không hợp lệ: $1" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "Lỗi: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "thiếu lệnh '$1'"; }
+
+need curl
+
+# Version mới nhất: thử dò tăng dần từ patch hiện tại rồi fallback về trang chủ.
+latest_version() {
+  if [ -n "$PIN_VERSION" ]; then echo "$PIN_VERSION"; return; fi
+  local home=/tmp/zcode-home.$$.html
+  if curl -sfL --max-time 25 https://zcode.z.ai/ -o "$home"; then
+    local v
+    v=$(grep -oE 'releases/[0-9]+\.[0-9]+\.[0-9]+' "$home" | sed 's#releases/##' | sort -V | tail -1)
+    rm -f "$home"
+    [ -n "$v" ] && { echo "$v"; return; }
+  fi
+  rm -f "$home"
+  die "không xác định được version mới nhất; dùng --version <x.y.z>"
+}
+
+VERSION="$(latest_version)"
+BASE="$CDN/$VERSION/$PLATFORM"
+ASSET="ZCode-$VERSION-$PLATFORM.AppImage"
+
+echo "CDN:      $CDN"
+echo "Version:  $VERSION"
+echo "Platform: $PLATFORM"
+
+if [ "$CHECK_ONLY" = "1" ]; then
+  echo "Bản mới nhất: $VERSION"
+  exit 0
+fi
+
+# latest.yml -> sha512 để verify sau khi tải.
+verify_sha512() {
+  local file="$1" expected="$2"
+  [ -n "$expected" ] || { echo "Cảnh báo: không có sha512 để verify" >&2; return 0; }
+  need openssl
+  local actual
+  actual=$(openssl dgst -sha512 -binary "$file" | openssl base64 -A)
+  if [ "$actual" != "$expected" ]; then
+    die "sha512 không khớp! file=$file"
+  fi
+  echo "sha512: OK"
+}
+
+sha512_for() {
+  local asset="$1" yml=/tmp/zcode-latest.$$.yml
+  curl -sf --max-time 20 "$BASE/latest.yml" -o "$yml" || { rm -f "$yml"; return 0; }
+  local sum
+  sum=$(awk -v a="$asset" '$0 ~ "url: *"a"$" {found=1; next} found && $1=="sha512:" {print $2; exit}' "$yml")
+  rm -f "$yml"
+  echo "$sum"
+}
+
+if [ "$MODE" = "deb" ] || [ "$MODE" = "rpm" ]; then
+  ASSET="ZCode-$VERSION-$PLATFORM.$MODE"
+fi
+
+DEST="$INSTALL_DIR/ZCode-$VERSION"
+WRAPPER="$BIN_DIR/zcode"
+PKG="/tmp/$ASSET"
+
+if [ "$MODE" = "appimage" ] && [ -x "$DEST/zcode" ] && [ "$FORCE" = "0" ]; then
+  echo "Đã cài $DEST (dùng --force để cài lại)"
+  echo "Bản đã cài: $VERSION"
+  exit 0
+fi
+
+echo "→ tải $ASSET"
+curl -fL --progress-bar "$BASE/$ASSET" -o "$PKG" || die "tải thất bại: $BASE/$ASSET"
+SUM="$(sha512_for "$ASSET")"
+verify_sha512 "$PKG" "$SUM"
+
+case "$MODE" in
+  deb|rpm)
+    need sudo
+    echo "→ cài package (cần sudo)"
+    if [ "$MODE" = "deb" ]; then sudo apt install -y "$PKG"; else sudo rpm -Uvh "$PKG"; fi
+    rm -f "$PKG"
+    echo "Đã cài bằng package manager. Lệnh zcode do gói cung cấp."
+    exit 0
+    ;;
+esac
+
+# AppImage -> extract (không cần libfuse2)
+need chmod
+mkdir -p "$INSTALL_DIR"
+chmod +x "$PKG"
+echo "→ extract AppImage vào $DEST (không cần FUSE)"
+rm -rf "$DEST"
+mkdir -p "$DEST.work"
+( cd "$DEST.work" && "$PKG" --appimage-extract >/dev/null 2>&1 ) || die "extract thất bại"
+mv "$DEST.work/squashfs-root" "$DEST"
+rm -rf "$DEST.work" "$PKG"
+
+# Wrapper: set APPDIR + LD_LIBRARY_PATH rồi exec binary thật.
+mkdir -p "$BIN_DIR"
+cat > "$WRAPPER" <<EOF
+#!/bin/sh
+APPDIR="$DEST"
+export APPDIR
+export PATH="\$APPDIR:\$PATH"
+export LD_LIBRARY_PATH="\$APPDIR/usr/lib:\$APPDIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+exec "\$APPDIR/zcode" "\$@"
+EOF
+chmod +x "$WRAPPER"
+
+# Desktop entry + icon cho menu ứng dụng.
+APPS_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/512x512/apps"
+mkdir -p "$APPS_DIR" "$ICON_DIR"
+[ -f "$DEST/zcode.png" ] && cp -f "$DEST/zcode.png" "$ICON_DIR/zcode.png"
+cat > "$APPS_DIR/zcode.desktop" <<EOF
+[Desktop Entry]
+Name=ZCode
+Comment=Z.ai coding agent
+Exec=$WRAPPER %U
+Icon=$ICON_DIR/zcode.png
+Type=Application
+Categories=Development;
+Terminal=false
+StartupWMClass=ZCode
+EOF
+update-desktop-database "$APPS_DIR" 2>/dev/null || true
+
+echo
+echo "Đã cài ZCode $VERSION:"
+echo "  app:     $DEST"
+echo "  lệnh:    $WRAPPER"
+echo "  menu:    $APPS_DIR/zcode.desktop"
+echo
+echo "Chạy: zcode"
